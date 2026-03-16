@@ -1,0 +1,71 @@
+# Frontend Setup (Angular) — Polymarket BTC 15m Bot
+
+## Goal
+Build a clean Angular UI that shows bot status, recent signals, and trades, with a lightweight local API as the data source.
+
+## Architecture
+- Backend bot (in `backend/`)
+- Local API service (new, small FastAPI or Flask)
+- Angular frontend (new)
+
+## What The Frontend Should Include
+- Status panel
+- Current mode: `SIMULATION` or `LIVE`
+- Connection status to Polymarket
+- Last tick time
+- Current market and token prices (Up/Down)
+- Recent signals (direction, score, confidence, reason)
+- Recent trades (paper + live)
+- Paper trades list from `backend/paper_trades.json`
+- Account balance (USDC.e)
+- Orders list (open, filled, rejected)
+- Error/Warning log feed
+- Controls
+- Start/Stop bot
+- Toggle simulation/live
+- Refresh credentials
+
+## Data Endpoints (API)
+- `GET /status`
+- `GET /market`
+- `GET /signals`
+- `GET /trades`
+- `GET /paper-trades`
+- `GET /orders`
+- `GET /logs`
+
+## Angular Project Setup
+```
+ng new frontend
+cd frontend
+ng serve
+```
+
+## UI Layout
+- Top bar: bot status, mode, connection
+- Left column: market data, signals
+- Right column: trades, orders
+- Bottom: logs
+
+## Suggested Components
+- `StatusCardComponent`
+- `MarketCardComponent`
+- `SignalListComponent`
+- `TradeTableComponent`
+- `OrderTableComponent`
+- `LogFeedComponent`
+- `ControlsComponent`
+
+## Data Refresh
+- Poll API every 3–5 seconds
+- Use Angular `HttpClient`
+- Optional: WebSocket for logs later
+
+## Security Notes
+- Never expose private keys or API secrets in frontend
+- Keep API bound to localhost unless you add auth
+
+## Next Steps
+- Build minimal API endpoints in Python
+- Scaffold Angular app and connect to API
+- Add charts (signals/trade P&L)
