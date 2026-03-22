@@ -68,7 +68,12 @@ from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
 from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
+from monitoring.api_server import ApiServer, ApiContext
 from feedback.learning_engine import get_learning_engine
+
+# Persistence layer
+from persistence import init_database, close_database, get_repository, TradingRepository
+
 load_dotenv()
 from patch_market_orders import apply_market_order_patch
 patch_applied = apply_market_order_patch()
@@ -137,7 +142,7 @@ class IntegratedBTCStrategy(Strategy):
     - Correct timing for market switching
     """
 
-    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False):
+    def __init__(self, redis_client=None, enable_grafana=True, test_mode=False, enable_api=True, simulation_default=True):
         super().__init__()
 
         self.bot_start_time = datetime.now(timezone.utc)
@@ -147,6 +152,8 @@ class IntegratedBTCStrategy(Strategy):
         self.instrument_id = None
         self.redis_client = redis_client
         self.current_simulation_mode = False
+        self.simulation_default = simulation_default
+        self.enable_api = enable_api
 
         # Store ALL BTC instruments
         self.all_btc_instruments: List[Dict] = []
@@ -224,12 +231,19 @@ class IntegratedBTCStrategy(Strategy):
         else:
             self.grafana_exporter = None
 
+        # Optional API server for frontend
+        self.api_server = None
+
         # Price history
         self.price_history = []
         self.max_history = 100
 
         # Paper trading tracker
         self.paper_trades: List[PaperTrade] = []
+
+        # Persistence
+        self._db_initialized = False
+        self._repo: Optional[TradingRepository] = None
 
         self.test_mode = test_mode
 
@@ -313,6 +327,11 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
 
         # =========================================================================
+        # Initialize PostgreSQL persistence
+        # =========================================================================
+        self.run_in_executor(self._init_database_sync)
+
+        # =========================================================================
         # FIX 2: Load ALL BTC instruments at startup
         # =========================================================================
         self._load_all_btc_instruments()
@@ -347,6 +366,22 @@ class IntegratedBTCStrategy(Strategy):
             import threading
             threading.Thread(target=self._start_grafana_sync, daemon=True).start()
 
+        if self.enable_api:
+            try:
+                api_context = ApiContext(
+                    strategy=self,
+                    start_time=self.bot_start_time,
+                    simulation_default=self.simulation_default,
+                    test_mode=self.test_mode,
+                    redis_client=self.redis_client,
+                )
+                host = os.getenv("API_SERVER_HOST", "127.0.0.1")
+                port = int(os.getenv("API_SERVER_PORT", 8081))
+                self.api_server = ApiServer(context=api_context, host=host, port=port)
+                self.api_server.start()
+            except Exception as e:
+                logger.warning(f"API server failed to start: {e}")
+
         logger.info("=" * 80)
         logger.info("Strategy active - will trade every 15 minutes")
         logger.info(f"Price history: {len(self.price_history)} points")
@@ -355,6 +390,27 @@ class IntegratedBTCStrategy(Strategy):
         else:
             logger.warning(f"⚠ Need more history ({len(self.price_history)}/20)")
         logger.info("=" * 80)
+
+    def _init_database_sync(self):
+        """Initialize database connection (called from executor)."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._init_database())
+        finally:
+            loop.close()
+
+    async def _init_database(self):
+        """Initialize PostgreSQL database connection."""
+        try:
+            await init_database(create_tables=True)
+            self._repo = get_repository()
+            self._db_initialized = True
+            logger.info("PostgreSQL persistence initialized")
+        except Exception as e:
+            logger.warning(f"PostgreSQL persistence unavailable: {e}")
+            logger.warning("Trading will continue without database persistence")
+            self._db_initialized = False
 
     def _generate_synthetic_history(self, target_count: int = 20, existing_count: int = 0):
         """Generate synthetic price history for testing"""
@@ -917,8 +973,11 @@ class IntegratedBTCStrategy(Strategy):
         # (price near $0.50) almost always lose, while trades at 1.4 shares
         # (price ~$0.71) mostly win.
         # =========================================================================
-        TREND_UP_THRESHOLD   = 0.60   # price above this → buy YES (UP)
-        TREND_DOWN_THRESHOLD = 0.40   # price below this → buy NO (DOWN)
+        # TIGHTENED THRESHOLDS for higher win rate
+        # At 0.68, we expect ~68% win rate (before slippage)
+        # This reduces trade frequency but increases quality
+        TREND_UP_THRESHOLD   = 0.68   # price above this → buy YES (UP)
+        TREND_DOWN_THRESHOLD = 0.32   # price below this → buy NO (DOWN)
 
         price_float = float(current_price)
 
@@ -974,13 +1033,154 @@ class IntegratedBTCStrategy(Strategy):
                 self.last_trade_time = -1  # Allow retry next tick
                 return
 
+        # --- Persist market snapshot, signals, and fused signal ---
+        market_snapshot_id = None
+        fused_signal_id = None
+        if self._db_initialized and self._repo:
+            try:
+                market_snapshot_id, fused_signal_id = await self._persist_trading_context(
+                    current_price=current_price,
+                    metadata=metadata,
+                    signals=signals,
+                    fused=fused,
+                    direction=direction,
+                    trend_confidence=trend_confidence,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to persist trading context: {e}")
+
         # --- Phase 5 / 6: Execute ---
         if is_simulation:
-            await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
+            await self._record_paper_trade(
+                fused, POSITION_SIZE_USD, current_price, direction,
+                metadata=metadata,
+                trend_confidence=trend_confidence,
+                market_snapshot_id=market_snapshot_id,
+                fused_signal_id=fused_signal_id,
+            )
         else:
-            await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
+            await self._place_real_order(
+                fused, POSITION_SIZE_USD, current_price, direction,
+                metadata=metadata,
+                trend_confidence=trend_confidence,
+                market_snapshot_id=market_snapshot_id,
+                fused_signal_id=fused_signal_id,
+            )
             
-    async def _record_paper_trade(self, signal, position_size, current_price, direction):
+    async def _persist_trading_context(
+        self,
+        current_price: Decimal,
+        metadata: dict,
+        signals: list,
+        fused,
+        direction: str,
+        trend_confidence: float,
+    ) -> tuple:
+        """
+        Persist market snapshot, individual signals, and fused signal to PostgreSQL.
+
+        Returns:
+            Tuple of (market_snapshot_id, fused_signal_id)
+        """
+        if not self._repo:
+            return None, None
+
+        # Get current market info
+        current_market = None
+        market_slug = None
+        if (self.current_instrument_index >= 0 and
+                self.current_instrument_index < len(self.all_btc_instruments)):
+            current_market = self.all_btc_instruments[self.current_instrument_index]
+            market_slug = current_market.get('slug')
+
+        # Get bid/ask from last tick
+        bid_price = ask_price = current_price
+        if self._last_bid_ask:
+            bid_price, ask_price = self._last_bid_ask
+
+        # Save market snapshot
+        market_snapshot_id = await self._repo.save_market_snapshot(
+            market_slug=market_slug or "unknown",
+            instrument_id=str(self.instrument_id) if self.instrument_id else "unknown",
+            bid_price=bid_price,
+            ask_price=ask_price,
+            yes_token_id=self._yes_token_id,
+            no_token_id=str(self._no_instrument_id) if self._no_instrument_id else None,
+            market_start_time=current_market.get('start_time') if current_market else None,
+            market_end_time=current_market.get('end_time') if current_market else None,
+            btc_spot_price=Decimal(str(metadata.get('spot_price'))) if metadata.get('spot_price') else None,
+            btc_spot_source="coinbase",
+            fear_greed_index=metadata.get('sentiment_score'),
+            fear_greed_classification=metadata.get('sentiment_classification'),
+            price_sma_20=Decimal(str(metadata.get('deviation', 0) * float(current_price) + float(current_price))) if metadata.get('deviation') else None,
+            price_deviation_pct=metadata.get('deviation'),
+            momentum_5p=metadata.get('momentum'),
+            volatility=metadata.get('volatility'),
+            extra_data={
+                "trend_direction": direction,
+                "trend_confidence": trend_confidence,
+                "price_history_len": len(self.price_history),
+            },
+        )
+
+        # Save individual signals
+        signal_ids = []
+        for sig in signals:
+            sig_metadata = {}
+            if hasattr(sig, 'metadata') and sig.metadata:
+                # Convert Decimal values to float for JSON
+                for k, v in sig.metadata.items():
+                    if isinstance(v, Decimal):
+                        sig_metadata[k] = float(v)
+                    else:
+                        sig_metadata[k] = v
+
+            sig_id = await self._repo.save_trading_signal(
+                source=sig.source,
+                signal_type=str(sig.signal_type.value) if hasattr(sig.signal_type, 'value') else str(sig.signal_type),
+                direction=str(sig.direction.value) if hasattr(sig.direction, 'value') else str(sig.direction),
+                score=sig.score,
+                confidence=sig.confidence,
+                current_price=current_price,
+                strength=str(sig.strength.value) if hasattr(sig, 'strength') and sig.strength and hasattr(sig.strength, 'value') else None,
+                target_price=sig.target_price if hasattr(sig, 'target_price') else None,
+                stop_loss_price=sig.stop_loss if hasattr(sig, 'stop_loss') else None,
+                market_snapshot_id=market_snapshot_id,
+                metadata=sig_metadata,
+            )
+            signal_ids.append(sig_id)
+
+        # Save fused signal
+        weights_snapshot = {}
+        for source in ["OrderBookImbalance", "TickVelocity", "PriceDivergence",
+                       "SpikeDetection", "DeribitPCR", "SentimentAnalysis"]:
+            try:
+                weights_snapshot[source] = self.fusion_engine.get_weight(source)
+            except:
+                pass
+
+        fused_signal_id = await self._repo.save_fused_signal(
+            direction=str(fused.direction.value) if hasattr(fused.direction, 'value') else str(fused.direction),
+            score=fused.score,
+            confidence=fused.confidence,
+            num_signals=fused.num_signals if hasattr(fused, 'num_signals') else len(signals),
+            bullish_contribution=getattr(fused, 'bullish_contrib', None),
+            bearish_contribution=getattr(fused, 'bearish_contrib', None),
+            is_strong=fused.score >= 70.0,
+            is_actionable=fused.score >= 60.0 and fused.confidence >= 0.6,
+            weights_snapshot=weights_snapshot,
+            market_snapshot_id=market_snapshot_id,
+            current_price=current_price,
+            contributing_signal_ids=signal_ids,
+        )
+
+        logger.debug(f"Persisted: snapshot={market_snapshot_id}, signals={len(signal_ids)}, fused={fused_signal_id}")
+        return market_snapshot_id, fused_signal_id
+
+    async def _record_paper_trade(
+        self, signal, position_size, current_price, direction,
+        metadata=None, trend_confidence=None, market_snapshot_id=None, fused_signal_id=None
+    ):
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
 
@@ -1030,6 +1230,46 @@ class IntegratedBTCStrategy(Strategy):
             self.grafana_exporter.increment_trade_counter(won=(pnl > 0))
             self.grafana_exporter.record_trade_duration(exit_delta.total_seconds())
 
+        # Persist to PostgreSQL
+        if self._db_initialized and self._repo:
+            try:
+                current_market = None
+                market_slug = None
+                if (self.current_instrument_index >= 0 and
+                        self.current_instrument_index < len(self.all_btc_instruments)):
+                    current_market = self.all_btc_instruments[self.current_instrument_index]
+                    market_slug = current_market.get('slug')
+
+                pnl_pct = float(pnl / position_size * 100) if position_size else 0.0
+
+                await self._repo.save_paper_trade(
+                    direction=direction.upper(),
+                    size_usd=position_size,
+                    entry_price=current_price,
+                    signal_score=signal.score,
+                    signal_confidence=signal.confidence,
+                    exit_price=exit_price,
+                    outcome=outcome,
+                    pnl_usd=pnl,
+                    pnl_pct=pnl_pct,
+                    market_slug=market_slug,
+                    btc_spot_price=Decimal(str(metadata.get('spot_price'))) if metadata and metadata.get('spot_price') else None,
+                    fear_greed_index=metadata.get('sentiment_score') if metadata else None,
+                    trend_direction="UP" if direction == "long" else "DOWN",
+                    trend_confidence=trend_confidence,
+                    timeframe="15min",  # Direct parameter for proper column storage
+                    metadata={
+                        "fused_signal_id": fused_signal_id,
+                        "market_snapshot_id": market_snapshot_id,
+                        "num_signals": signal.num_signals if hasattr(signal, 'num_signals') else 1,
+                        "fusion_score": signal.score,
+                        "test_mode": self.test_mode,
+                    },
+                )
+                logger.debug(f"15-min paper trade persisted to PostgreSQL")
+            except Exception as e:
+                logger.warning(f"Failed to persist paper trade: {e}")
+
         logger.info("=" * 80)
         logger.info("[SIMULATION] PAPER TRADE RECORDED")
         logger.info(f"  Direction: {direction.upper()}")
@@ -1056,7 +1296,10 @@ class IntegratedBTCStrategy(Strategy):
     # Real order (unchanged)
     # ------------------------------------------------------------------
 
-    async def _place_real_order(self, signal, position_size, current_price, direction):
+    async def _place_real_order(
+        self, signal, position_size, current_price, direction,
+        metadata=None, trend_confidence=None, market_snapshot_id=None, fused_signal_id=None
+    ):
         if not self.instrument_id:
             logger.error("No instrument available")
             return
@@ -1135,6 +1378,50 @@ class IntegratedBTCStrategy(Strategy):
             logger.info("=" * 80)
 
             self._track_order_event("placed")
+
+            # Persist trade to PostgreSQL
+            if self._db_initialized and self._repo:
+                try:
+                    current_market = None
+                    market_slug = None
+                    if (self.current_instrument_index >= 0 and
+                            self.current_instrument_index < len(self.all_btc_instruments)):
+                        current_market = self.all_btc_instruments[self.current_instrument_index]
+                        market_slug = current_market.get('slug')
+
+                    await self._repo.save_trade(
+                        trade_id=unique_id,
+                        direction=direction,
+                        entry_price=current_price,
+                        size_usd=position_size,
+                        side="BUY",
+                        is_simulation=False,
+                        quantity=Decimal(str(token_qty)),
+                        signal_score=signal.score,
+                        signal_confidence=signal.confidence,
+                        signal_direction=str(signal.direction.value) if hasattr(signal.direction, 'value') else str(signal.direction),
+                        fused_signal_id=fused_signal_id,
+                        trend_direction="UP" if direction == "long" else "DOWN",
+                        trend_confidence=trend_confidence,
+                        price_at_decision=current_price,
+                        market_slug=market_slug,
+                        instrument_id=str(trade_instrument_id),
+                        yes_token_id=self._yes_token_id,
+                        no_token_id=str(self._no_instrument_id) if self._no_instrument_id else None,
+                        market_snapshot_id=market_snapshot_id,
+                        order_id=unique_id,
+                        metadata={
+                            "timeframe": "15min",
+                            "trade_label": trade_label,
+                            "token_qty": float(token_qty),
+                            "estimated_cost_usd": max_usd_amount,
+                            "spot_price": metadata.get('spot_price') if metadata else None,
+                            "fear_greed": metadata.get('sentiment_score') if metadata else None,
+                        },
+                    )
+                    logger.debug(f"15-min trade persisted to PostgreSQL: {unique_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to persist trade: {e}")
 
         except Exception as e:
             logger.error(f"Error placing real order: {e}")
@@ -1254,6 +1541,15 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("=" * 80)
         self._track_order_event("filled")
 
+        # Persist order fill event
+        if self._db_initialized and self._repo:
+            self.run_in_executor(lambda: self._persist_order_event_sync(
+                order_id=str(event.client_order_id),
+                event_type="filled",
+                fill_price=float(event.last_px),
+                fill_quantity=float(event.last_qty),
+            ))
+
     def on_order_denied(self, event):
         logger.error("=" * 80)
         logger.error(f"ORDER DENIED!")
@@ -1261,6 +1557,14 @@ class IntegratedBTCStrategy(Strategy):
         logger.error(f"  Reason: {event.reason}")
         logger.error("=" * 80)
         self._track_order_event("rejected")
+
+        # Persist order denied event
+        if self._db_initialized and self._repo:
+            self.run_in_executor(lambda: self._persist_order_event_sync(
+                order_id=str(event.client_order_id),
+                event_type="denied",
+                rejection_reason=str(event.reason),
+            ))
 
     def on_order_rejected(self, event):
         """Handle order rejection — reset trade timer so we can retry next tick."""
@@ -1274,6 +1578,38 @@ class IntegratedBTCStrategy(Strategy):
             self.last_trade_time = -1  # Allow retry on next quote tick
         else:
             logger.warning(f"Order rejected: {reason}")
+
+        # Persist order rejection event
+        if self._db_initialized and self._repo:
+            self.run_in_executor(lambda: self._persist_order_event_sync(
+                order_id=str(getattr(event, 'client_order_id', 'unknown')),
+                event_type="rejected",
+                rejection_reason=reason,
+            ))
+
+    def _persist_order_event_sync(
+        self,
+        order_id: str,
+        event_type: str,
+        fill_price: float = None,
+        fill_quantity: float = None,
+        rejection_reason: str = None,
+    ):
+        """Sync wrapper to persist order event."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._repo.save_order_event(
+                order_id=order_id,
+                event_type=event_type,
+                fill_price=Decimal(str(fill_price)) if fill_price else None,
+                fill_quantity=Decimal(str(fill_quantity)) if fill_quantity else None,
+                rejection_reason=rejection_reason,
+            ))
+        except Exception as e:
+            logger.warning(f"Failed to persist order event: {e}")
+        finally:
+            loop.close()
 
     # ------------------------------------------------------------------
     # Grafana / stop
@@ -1292,11 +1628,29 @@ class IntegratedBTCStrategy(Strategy):
     def on_stop(self):
         logger.info("Integrated BTC strategy stopped")
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
+
+        # Close database connection
+        if self._db_initialized:
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(close_database())
+                logger.info("PostgreSQL connection closed")
+            except Exception as e:
+                logger.warning(f"Error closing database: {e}")
+            finally:
+                loop.close()
+
         if self.grafana_exporter:
-            import asyncio
             try:
                 loop = asyncio.new_event_loop()
                 loop.run_until_complete(self.grafana_exporter.stop())
+            except Exception:
+                pass
+
+        if self.api_server:
+            try:
+                self.api_server.stop()
             except Exception:
                 pass
 
@@ -1304,7 +1658,7 @@ class IntegratedBTCStrategy(Strategy):
 # Runner
 # ---------------------------------------------------------------------------
 
-def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False):
+def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, test_mode: bool = False, enable_api: bool = True):
     """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
     
     print("=" * 80)
@@ -1330,6 +1684,7 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
     print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
     print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
+    print(f"  API Server: {'Enabled' if enable_api else 'Disabled'}")
     print(f"  Max Trade Size: ${os.getenv('MARKET_BUY_USD', '1.00')}")
     print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
     print()
@@ -1404,6 +1759,8 @@ def run_integrated_bot(simulation: bool = False, enable_grafana: bool = True, te
         redis_client=redis_client,
         enable_grafana=enable_grafana,
         test_mode=test_mode,
+        enable_api=enable_api,
+        simulation_default=simulation,
     )
 
     print("\nBuilding Nautilus node...")
@@ -1434,11 +1791,13 @@ def main():
     parser.add_argument("--live", action="store_true",
                         help="Run in LIVE mode (real money at risk!). Default is simulation.")
     parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana metrics")
+    parser.add_argument("--no-api", action="store_true", help="Disable API server")
     parser.add_argument("--test-mode", action="store_true",
                         help="Run in TEST MODE (trade every minute for faster testing)")
 
     args = parser.parse_args()
     enable_grafana = not args.no_grafana
+    enable_api = not args.no_api
     test_mode = args.test_mode
 
     # --test-mode ALWAYS forces simulation even if --live is also passed
@@ -1457,7 +1816,7 @@ def main():
         logger.info("No real orders will be placed.")
         logger.info("=" * 80)
 
-    run_integrated_bot(simulation=simulation, enable_grafana=enable_grafana, test_mode=test_mode)
+    run_integrated_bot(simulation=simulation, enable_grafana=enable_grafana, test_mode=test_mode, enable_api=enable_api)
 
 
 if __name__ == "__main__":

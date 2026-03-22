@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile:*)",
+      "Bash(pip install:*)",
+      "Bash(timeout 45 python:*)",
+      "Bash(ls:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(where:*)",
+      "Bash(source:*)",
+      "Bash(python bot.py:*)",
+      "Bash(tee:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}
